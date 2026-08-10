@@ -1,0 +1,6 @@
+httpx>=0.24.0
+curl_cffi>=0.7.0
+pycryptodome>=3.20.0
+opencv-python-headless>=4.9.0
+numpy>=1.24.0
+requests>=2.31.0
