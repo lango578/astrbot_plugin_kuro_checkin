@@ -86,6 +86,10 @@ pip install httpx curl_cffi pycryptodome opencv-python-headless numpy requests
 | `enable_forum_sign` | 社区签到（库洛币） | 开 |
 | `enable_forum_tasks` | 论坛每日任务（浏览/点赞/分享） | 关 |
 
+## 📚 教程
+
+- [自动签到结果推送教程](docs/自动签到结果推送教程.md) — 了解「自动签到后推送结果到绑定会话」的绑定、配置与工作原理
+
 ## ⚠️ 注意
 
 - 仅供个人学习交流使用，请勿滥用。
