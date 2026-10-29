@@ -39,5 +39,24 @@
         "description": "启用论坛每日任务（浏览/点赞/分享，可额外获得库洛币）",
         "type": "bool",
         "default": false
+    },
+    "allow_all_users": {
+        "type": "bool",
+        "default": true,
+        "description": "是否允许所有会话成员使用登录/绑定/解绑/签到指令",
+        "hint": "安全建议设为 false 并只把服主 QQ 号填进 operators。默认保持 true 是为了不改变已部署实例的行为；true 时任何能看到 bot 的人都能改写这里唯一的全局 token，也能用它向任意手机号申请短信。",
+        "obvious_hint": true
+    },
+    "operators": {
+        "type": "list",
+        "default": [],
+        "description": "白名单 QQ 号（allow_all_users=false 时生效）",
+        "hint": "填 sender_id，例如 [\"100012345\"]；留空会拒绝所有指令，状态指令会提示你补。"
+    },
+    "login_cooldown": {
+        "type": "int",
+        "default": 90,
+        "description": "同一用户两次申请短信验证码的最小间隔（秒）",
+        "hint": "防止被当作群发短信工具；库街区侧本身还有 60 秒频控。"
     }
 }

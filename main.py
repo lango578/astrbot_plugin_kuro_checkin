@@ -26,13 +26,14 @@ AstrBot 插件：库街区每日签到
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
+import re
 import sys
 import time
-import uuid
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 import httpx
 
@@ -51,6 +52,10 @@ if _PLUGIN_DIR not in sys.path:
 # ---------------------------------------------------------------------------
 
 API_BASE = "https://api.kurobbs.com"
+
+# GeeTest v4 服务端点（与 geeked/geeked.py 保持一致，此处显式拼绝对 URL，
+# 不再依赖 session.base_url 这个非标准属性）
+GEETEST_BASE = "https://gcaptcha4.geevisit.com"
 
 ENDPOINTS = {
     "user_mine": f"{API_BASE}/user/mineV2",
@@ -75,6 +80,7 @@ GAMES = {
 HELP_TEXT = (
     "【库街区每日签到】\n"
     "/库街区登录 <手机号>  一键登录（自动过滑块→发短信→回复验证码）\n"
+    "                  已绑定要换号时：/库街区登录 确认 <手机号>\n"
     "/库街区绑定 <token>  绑定 token（登录 www.kurobbs.com → F12 → Cookie → user_token）\n"
     "/库街区签到          立即执行每日签到（鸣潮/战双 + 社区）\n"
     "/库街区解绑          清除 token\n"
@@ -95,6 +101,9 @@ LOGIN_DISTINCT_ID = "19dafdce461609-023472cbe40c9b-1e462c69-2073600-19dafdce462e
 
 # 等待用户回复短信验证码的超时时间（秒）
 PENDING_TIMEOUT = 120
+
+# 同一用户两次申请短信的最小间隔（秒），防止被当作群发短信工具
+SMS_COOLDOWN = 90
 
 
 def _h5_login_headers() -> dict:
@@ -148,8 +157,12 @@ class KuroClient:
 
     def __init__(self, token: str, devcode: str = "", distinct_id: str = ""):
         self.token = token.strip()
-        self.devcode = devcode or str(uuid.uuid4())
-        self.distinct_id = distinct_id or str(uuid.uuid4())
+        # 缺设备标识时落到与 H5 登录同一个常量，而不是每次随机 —— 随机值会让
+        # 「登录设备」与「签到设备」不一致，属于被风控的常见诱因
+        self.devcode = devcode or LOGIN_DEVCODE
+        self.distinct_id = distinct_id or LOGIN_DISTINCT_ID
+        if not devcode or not distinct_id:
+            logger.warning("【库街区签到】KuroClient 未取得设备标识，已回落到登录用常量")
         self._client: Optional[httpx.AsyncClient] = None
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -248,8 +261,8 @@ class KuroClient:
                 records = result["data"]
                 if isinstance(records, list) and records:
                     return str(records[0].get("goodsName", ""))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"【库街区签到】查询签到奖励失败: {e}")
         return ""
 
     async def forum_sign(self) -> str:
@@ -269,7 +282,7 @@ class KuroClient:
         except Exception as e:
             return f"❌ 社区签到异常：{e}"
 
-    async def forum_tasks(self) -> list[str]:
+    async def forum_tasks(self) -> List[str]:
         """执行论坛每日任务：浏览帖子、点赞、分享。"""
         results: list[str] = []
         # 1. 获取帖子列表
@@ -350,8 +363,8 @@ class KuroClient:
             if resp.get("success") and resp.get("data"):
                 gold = resp["data"].get("goldNum", 0)
                 return f"💰 当前库洛币: {gold}"
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"【库街区签到】查询库洛币失败: {e}")
         return ""
 
 
@@ -363,7 +376,7 @@ class KuroClient:
     "astrbot_plugin_kuro_checkin",
     "AstrBot User",
     "每天自动在库街区进行每日签到（鸣潮/战双+社区）",
-    "1.0.0",
+    "1.2.0",
 )
 class KuroCheckinPlugin(Star):
     """库街区每日签到插件。"""
@@ -372,6 +385,7 @@ class KuroCheckinPlugin(Star):
         super().__init__(context)
         self.config = config
         self._auto_task: Optional[asyncio.Task] = None
+        self._sms_last: Dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -384,19 +398,25 @@ class KuroCheckinPlugin(Star):
         except Exception as e:
             logger.error(f"【库街区签到】初始化设备信息失败: {e}")
         if self.config.get("auto_sign_enable", True):
+            if self._auto_task is not None and not self._auto_task.done():
+                # 重复加载时先取消旧任务，避免留下游离协程
+                await self.terminate()
             self._auto_task = asyncio.create_task(self._auto_sign_loop())
             logger.info("【库街区签到】每日自动签到任务已启动")
         logger.info("【库街区签到】插件初始化完成")
 
     async def terminate(self):
         """插件卸载/停用时调用。"""
-        if self._auto_task:
-            self._auto_task.cancel()
+        task, self._auto_task = self._auto_task, None
+        if task:
+            task.cancel()
             try:
-                await self._auto_task
-            except (asyncio.CancelledError, Exception):
+                await task
+            except asyncio.CancelledError:
+                # Python 3.8+ 起 CancelledError 继承 BaseException，except Exception 接不住
                 pass
-            self._auto_task = None
+            except Exception as e:
+                logger.warning(f"【库街区签到】停止自动签到任务时出现异常: {e}")
 
     # ------------------------------------------------------------------
     # 配置辅助
@@ -405,14 +425,74 @@ class KuroCheckinPlugin(Star):
     def _get_token(self) -> str:
         return str(self.config.get("token", "") or "").strip()
 
+    # ------------------------------------------------------------------
+    # 权限与审计
+    # ------------------------------------------------------------------
+
+    def _operator_ids(self) -> Set[str]:
+        """读取白名单（兼容 str / list 两种配置写法）。"""
+        raw = self.config.get("operators", "") or ""
+        if isinstance(raw, str):
+            items = re.split(r"[,\s;，、]+", raw)
+        elif isinstance(raw, (list, tuple, set)):
+            items = [str(x) for x in raw]
+        else:
+            items = [str(raw)]
+        return {x.strip() for x in items if str(x).strip()}
+
+    def _is_operator(self, event: AstrMessageEvent) -> Tuple[bool, str]:
+        """写操作（登录/绑定/解绑）与手动签到的权限判定。"""
+        if self.config.get("allow_all_users", True):
+            return True, ""
+        sender = str(event.get_sender_id() or "")
+        allowed = self._operator_ids()
+        if not allowed:
+            logger.error("【库街区签到】allow_all_users=false 但 operators 为空，所有指令被拒绝")
+            return False, (
+                "❌ 已开启权限限制，但白名单为空。\n"
+                "请在 AstrBot 插件配置里填写 operators（你的 QQ 号），"
+                "或将 allow_all_users 设为 true。"
+            )
+        if sender in allowed:
+            return True, ""
+        logger.warning(
+            f"【库街区签到】拒绝非白名单操作：sender={sender} cmd={event.message_str[:20]}"
+        )
+        return False, "❌ 没有权限执行该操作。"
+
+    def _sms_throttle_ok(self, user_id: str) -> Tuple[bool, str]:
+        """短信发送频控：同一用户窗口内只允许一次，防群发短信滥用。"""
+        now = time.time()
+        window = float(self.config.get("login_cooldown", SMS_COOLDOWN))
+        last = self._sms_last.get(user_id, 0)
+        if now - last < window:
+            wait = int(window - (now - last)) + 1
+            logger.info(f"【库街区签到】短信频控拦截：user={user_id}")
+            return False, f"⏳ 操作过于频繁，请 {wait} 秒后再试。"
+        self._sms_last[user_id] = now
+        return True, ""
+
+    @staticmethod
+    def _mask_token(token: str) -> str:
+        """token 摘要：只用于人工核对是否同一个 token，不可还原内容。"""
+        if len(token) < 8:
+            return "****"
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()[:8]
+        return f"sha256:{digest}（共 {len(token)} 位）"
+
     def _ensure_device(self):
-        """确保 devcode / distinct_id 存在并持久化（保持设备标识稳定）。"""
+        """确保 devcode / distinct_id 存在并持久化（保持设备标识稳定）。
+
+        与 H5 登录接口使用的设备标识保持一致：登录成功后 config 里存的就是
+        LOGIN_DEVCODE / LOGIN_DISTINCT_ID，此处不再另生成随机 UUID，
+        否则「登录设备」与「签到设备」不一致，容易被库街区风控判为异常。
+        """
         changed = False
         if not self.config.get("devcode"):
-            self.config["devcode"] = str(uuid.uuid4())
+            self.config["devcode"] = LOGIN_DEVCODE
             changed = True
         if not self.config.get("distinct_id"):
-            self.config["distinct_id"] = str(uuid.uuid4())
+            self.config["distinct_id"] = LOGIN_DISTINCT_ID
             changed = True
         if changed:
             try:
@@ -425,15 +505,35 @@ class KuroCheckinPlugin(Star):
         )
 
     @staticmethod
-    def _extract_token(raw: str) -> str:
-        """从粘贴内容中提取 user_token（兼容直接粘贴完整 Cookie）。"""
-        raw = raw.strip()
+    def _extract_token(raw: str) -> Tuple[Optional[str], str]:
+        """从粘贴内容中提取 user_token。
+
+        返回 (token, 错误说明)。token 为 None 时错误说明可直接回复给用户。
+        粘贴整串 Cookie 但没有 user_token 的情况必须拒绝——否则整串 Cookie
+        会被当成 token 存进配置并持久化，属于凭据误存。
+        """
+        raw = (raw or "").strip()
+        if not raw:
+            return None, "❌ 未检测到 token 内容。"
         if "user_token=" in raw:
             for part in raw.split(";"):
                 part = part.strip()
                 if part.startswith("user_token="):
-                    return part[len("user_token="):].strip()
-        return raw.strip('"').strip("'")
+                    raw = part[len("user_token="):].strip()
+                    break
+            else:
+                return None, "❌ 粘贴的 Cookie 里没有 user_token 字段。"
+        elif "=" in raw and ";" in raw:
+            return None, (
+                "❌ 看起来你粘贴了整串 Cookie，但其中没有 user_token。\n"
+                "请只复制 user_token 那一项的值（F12 → Application → Cookies → user_token）。"
+            )
+        token = raw.strip('"').strip("'").strip()
+        if len(token) < 20:
+            return None, "❌ token 过短（少于 20 位），请检查是否复制完整。"
+        if "," in token or " " in token:
+            return None, "❌ token 含空格或逗号，请只复制 user_token 的值本身。"
+        return token, ""
 
     # ------------------------------------------------------------------
     # 登录辅助（手机号 + 短信验证码）
@@ -450,25 +550,51 @@ class KuroCheckinPlugin(Star):
             os.makedirs(path, exist_ok=True)
         return path
 
+    def _pending_path(self) -> str:
+        return os.path.join(self._get_data_dir(), "pending_logins.json")
+
     def _load_pending(self) -> dict:
-        """读取等待验证码的登录状态。"""
+        """读取等待验证码的登录状态（顺带丢弃已过期条目）。"""
         try:
-            path = os.path.join(self._get_data_dir(), "pending_logins.json")
+            path = self._pending_path()
             if os.path.exists(path):
                 with open(path, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    data = json.load(f)
+                if not isinstance(data, dict):
+                    logger.warning("【库街区签到】登录状态文件格式异常，已忽略")
+                    return {}
+                now = time.time()
+                return {
+                    uid: entry
+                    for uid, entry in data.items()
+                    if isinstance(entry, dict)
+                    and now - float(entry.get("time", 0)) <= PENDING_TIMEOUT
+                }
         except Exception as e:
             logger.warning(f"【库街区签到】读取登录状态失败: {e}")
         return {}
 
     def _save_pending(self, data: dict):
-        """保存等待验证码的登录状态。"""
+        """原子保存登录状态：先写临时文件再 replace，避免并发覆写留下半截 JSON。
+
+        该文件含明文手机号，只保留未过期条目，插件卸载/解绑时应一并清理。
+        """
+        tmp = ""
         try:
-            path = os.path.join(self._get_data_dir(), "pending_logins.json")
-            with open(path, "w", encoding="utf-8") as f:
+            path = self._pending_path()
+            tmp = f"{path}.{os.getpid()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
         except Exception as e:
             logger.warning(f"【库街区签到】保存登录状态失败: {e}")
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
 
     def _solve_geetest(self):
         """解决 GeeTest 滑块验证码，返回 seccode dict 或 None。"""
@@ -480,6 +606,7 @@ class KuroCheckinPlugin(Star):
             return None
 
         captcha_id = "ec4aa4174277d822d73f2442a165a2cd"
+        geeked = None
         try:
             geeked = Geeked(captcha_id, risk_type="slide")
             data = geeked.load_captcha()
@@ -498,16 +625,27 @@ class KuroCheckinPlugin(Star):
                 "pt": "1",
                 "w": w,
             }
-            res = geeked.session.get(
-                f"{geeked.session.base_url}/verify", params=params
-            )
+            res = geeked.session.get(f"{GEETEST_BASE}/verify", params=params)
             parsed = json.loads(res.text.split(f"{geeked.callback}(")[1][:-1])
             if parsed["data"]["result"] == "success":
                 logger.info("【库街区签到】GeeTest 滑块验证成功")
                 return parsed["data"]["seccode"]
-            logger.warning(f"【库街区签到】GeeTest 验证结果: {parsed['data']['result']}")
+            # 失败时把服务端给出的细节带进日志，否则用户只能看到「滑块验证失败」
+            logger.warning(
+                "【库街区签到】GeeTest 验证未通过: result={} detail={}".format(
+                    parsed["data"].get("result"),
+                    json.dumps(parsed["data"].get("fail_ct") or parsed["data"], ensure_ascii=False)[:200],
+                )
+            )
         except Exception as e:
-            logger.error(f"【库街区签到】GeeTest 滑块解决失败: {e}")
+            logger.error(f"【库街区签到】GeeTest 滑块解决失败: {type(e).__name__}: {e}")
+        finally:
+            # 该 Session 建在 asyncio.to_thread 里，不关闭会每次登录留一个连接池
+            if geeked is not None:
+                try:
+                    geeked.session.close()
+                except Exception as e:
+                    logger.debug(f"【库街区签到】关闭 GeeTest 会话失败: {e}")
         return None
 
     def _send_sms(self, phone: str, seccode: dict) -> bool:
@@ -517,6 +655,7 @@ class KuroCheckinPlugin(Star):
         except ImportError as e:
             logger.error(f"【库街区签到】缺少依赖 curl_cffi: {e}")
             return False
+        sess = None
         try:
             sess = cffi_requests.Session(impersonate="chrome124")
             # 先触发一次，确保会话就绪
@@ -534,8 +673,14 @@ class KuroCheckinPlugin(Star):
             logger.info(f"【库街区签到】发送短信结果: {r.text[:120]}")
             return r.json().get("data", {}).get("geeTest") is False
         except Exception as e:
-            logger.error(f"【库街区签到】发送短信失败: {e}")
+            logger.error(f"【库街区签到】发送短信失败: {type(e).__name__}: {e}")
             return False
+        finally:
+            if sess is not None:
+                try:
+                    sess.close()
+                except Exception:
+                    pass
 
     def _do_sdk_login(self, phone: str, code: str) -> dict:
         """用短信验证码登录，返回接口 JSON。"""
@@ -544,6 +689,7 @@ class KuroCheckinPlugin(Star):
         except ImportError as e:
             logger.error(f"【库街区签到】缺少依赖 curl_cffi: {e}")
             return {"code": -1, "msg": f"缺少依赖 curl_cffi: {e}"}
+        sess = None
         try:
             sess = cffi_requests.Session(impersonate="chrome124")
             r = sess.post(
@@ -553,7 +699,14 @@ class KuroCheckinPlugin(Star):
             )
             return r.json()
         except Exception as e:
+            logger.error(f"【库街区签到】登录请求失败: {type(e).__name__}: {e}")
             return {"code": -1, "msg": str(e)}
+        finally:
+            if sess is not None:
+                try:
+                    sess.close()
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # 指令处理
@@ -562,6 +715,11 @@ class KuroCheckinPlugin(Star):
     @filter.command("库街区绑定", alias={"库街绑定", "kuro_bind", "kurobind"})
     async def bind_token(self, event: AstrMessageEvent):
         """绑定库街区 token"""
+        ok, deny = self._is_operator(event)
+        if not ok:
+            yield event.plain_result(deny)
+            return
+
         msg = event.message_str.strip()
         parts = msg.split(maxsplit=1)
         if len(parts) < 2:
@@ -571,18 +729,28 @@ class KuroCheckinPlugin(Star):
             )
             return
 
-        token = self._extract_token(parts[1])
-        if len(token) < 10:
-            yield event.plain_result("❌ token 格式不正确，请检查后重试")
+        token, err = self._extract_token(parts[1])
+        if token is None:
+            yield event.plain_result(err)
             return
 
+        old_token = self._get_token()
         self.config["token"] = token
         self.config["bind_umo"] = event.unified_msg_origin
         self.config["bind_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
             self.config.save_config()
         except Exception as e:
-            logger.error(f"【库街区签到】保存配置失败: {e}")
+            self.config["token"] = old_token
+            logger.error(f"【库街区签到】保存配置失败，已回滚 token: {e}")
+            yield event.plain_result(f"❌ 配置写入失败，本次绑定未生效：{e}")
+            return
+
+        # 只记摘要，绝不把 token 本体写进日志
+        logger.info(
+            f"【库街区签到】token 已由 sender={event.get_sender_id()} "
+            f"会话={event.unified_msg_origin} 绑定（{self._mask_token(token)}）"
+        )
         yield event.plain_result(
             "✅ 库街区 token 绑定成功！\n"
             "发送 /库街区签到 立即签到；之后每天会按配置的时间自动签到。"
@@ -599,14 +767,18 @@ class KuroCheckinPlugin(Star):
                 "token 获取方式：登录 www.kurobbs.com → F12 → Cookie → user_token"
             )
             return
+        ok, deny = self._is_operator(event)
+        if not ok:
+            yield event.plain_result(deny)
+            return
 
         # 记住推送会话，自动签到结果将推送到这里
         if self.config.get("push_result", True):
             try:
                 self.config["bind_umo"] = event.unified_msg_origin
                 self.config.save_config()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"【库街区签到】保存推送会话失败: {e}")
 
         yield event.plain_result("⏳ 正在执行库街区签到，请稍候…")
         lines = await self.do_sign_all()
@@ -615,11 +787,24 @@ class KuroCheckinPlugin(Star):
     @filter.command("库街区解绑", alias={"库街解绑", "kuro_unbind"})
     async def unbind(self, event: AstrMessageEvent):
         """清除已绑定的库街区 token"""
+        ok, deny = self._is_operator(event)
+        if not ok:
+            yield event.plain_result(deny)
+            return
+        had = bool(self._get_token())
+        old_token = self._get_token()
         self.config["token"] = ""
         try:
             self.config.save_config()
         except Exception as e:
+            self.config["token"] = old_token
             logger.error(f"【库街区签到】保存配置失败: {e}")
+            yield event.plain_result(f"❌ 配置写入失败，解绑未生效：{e}")
+            return
+        if had:
+            # 解绑顺带清掉待验证码状态，避免残留明文手机号
+            self._save_pending({})
+        logger.info(f"【库街区签到】token 已由 sender={event.get_sender_id()} 解绑")
         yield event.plain_result("✅ 已解绑库街区 token")
 
     @filter.command("库街区状态", alias={"库街状态", "kuro_status"})
@@ -629,15 +814,25 @@ class KuroCheckinPlugin(Star):
         if not token:
             yield event.plain_result("❌ 未绑定库街区 token")
             return
-        masked = token[:6] + "****" + token[-4:]
+        # 旧版会打印 token 前 6 后 4 个字符，群聊里等于泄露凭据片段，改为不可还原摘要
+        masked = self._mask_token(token)
         bind_time = str(self.config.get("bind_time", "未知") or "未知")
         auto_enabled = "开启" if self.config.get("auto_sign_enable", True) else "关闭"
         auto_time = str(self.config.get("auto_sign_time", "07:30"))
+        push_state = "开启" if self.config.get("push_result", True) else "关闭"
+        gate = (
+            "公开（任何人可操作）"
+            if self.config.get("allow_all_users", True)
+            # 不打印具体 QQ 号，群聊里白名单本身是隐私
+            else f"白名单（{len(self._operator_ids())} 人）"
+        )
         yield event.plain_result(
             f"📊 库街区状态：\n"
             f"Token: {masked}\n"
             f"绑定时间: {bind_time}\n"
-            f"自动签到: {auto_enabled}（每日 {auto_time}）"
+            f"自动签到: {auto_enabled}（每日 {auto_time}）\n"
+            f"结果推送: {push_state}\n"
+            f"操作权限: {gate}"
         )
 
     @filter.command("库街区帮助", alias={"库街帮助", "kuro_help"})
@@ -648,6 +843,11 @@ class KuroCheckinPlugin(Star):
     @filter.command("库街区登录", alias={"库街登录", "kuro_login", "kuologin"})
     async def login(self, event: AstrMessageEvent):
         """手机号+短信验证码一键登录（自动过 GeeTest 滑块）"""
+        ok, deny = self._is_operator(event)
+        if not ok:
+            yield event.plain_result(deny)
+            return
+
         msg = event.message_str.strip()
         parts = msg.split(maxsplit=1)
         if len(parts) < 2:
@@ -655,19 +855,42 @@ class KuroCheckinPlugin(Star):
             return
 
         phone = parts[1].strip()
+        confirmed = False
+        if phone.startswith("确认"):
+            tail = phone[len("确认"):].strip()
+            if not tail:
+                yield event.plain_result(
+                    "⚠️ 用法是 /库街区登录 确认 <手机号>\n（这是覆盖已有绑定前的二次确认）"
+                )
+                return
+            phone = tail
+            confirmed = True
         if not phone.isdigit() or len(phone) != 11:
             yield event.plain_result("❌ 手机号格式不正确（需 11 位数字）")
             return
 
-        user_id = event.get_sender_id()
+        user_id = str(event.get_sender_id())
+        # 先看是不是要覆盖已有绑定：只是被要求二次确认时不应烧掉短信配额
+        if self._get_token() and not confirmed:
+            yield event.plain_result(
+                "⚠️ 当前已绑定 token，登录成功会覆盖它。\n"
+                "如确认无误，请重新发送：/库街区登录 确认 " + phone
+            )
+            return
+
+        allowed, hint = self._sms_throttle_ok(user_id)
+        if not allowed:
+            yield event.plain_result(hint)
+            return
+
         yield event.plain_result("⏳ 正在过滑块验证，请稍候（约需 3~10 秒）...")
 
         # 同步的滑块求解放到线程中执行，避免阻塞事件循环
         seccode = await asyncio.to_thread(self._solve_geetest)
         if not seccode:
             yield event.plain_result(
-                "❌ 滑块验证失败，请重试。\n"
-                "提示：若多次失败可能是 GeeTest 风控升级，可改用 /库街区绑定 <token>"
+                "❌ 滑块验证失败，具体原因见控制台日志。\n"
+                "提示：可改用 /库街区绑定 <token>"
             )
             return
 
@@ -675,7 +898,7 @@ class KuroCheckinPlugin(Star):
         if not ok:
             yield event.plain_result(
                 "❌ 发送验证码失败，请稍后重试。\n"
-                "提示：发送过于频繁（60秒内）会失败，请等待后再试。"
+                f"提示：发送过于频繁（{SMS_COOLDOWN} 秒内）会失败。"
             )
             return
 
@@ -684,16 +907,16 @@ class KuroCheckinPlugin(Star):
         pending[user_id] = {"phone": phone, "time": time.time()}
         self._save_pending(pending)
         yield event.plain_result(
-            f"📱 验证码已发送到 {masked}，请在 2 分钟内直接回复验证码数字。"
+            f"📱 验证码已发送到 {masked}，请在 {PENDING_TIMEOUT // 60} 分钟内直接回复验证码数字。"
         )
 
     @filter.regex(r"^\d{4,6}$")
     async def on_sms_code(self, event: AstrMessageEvent):
         """捕获用户回复的短信验证码并完成登录"""
-        user_id = event.get_sender_id()
+        user_id = str(event.get_sender_id())
         pending = self._load_pending()
         entry = pending.get(user_id)
-        if not entry or time.time() - entry.get("time", 0) > PENDING_TIMEOUT:
+        if not entry or time.time() - float(entry.get("time", 0)) > PENDING_TIMEOUT:
             # 没有待登录状态，或已超时：不消费这条消息，交给其它逻辑处理
             return
 
@@ -707,13 +930,16 @@ class KuroCheckinPlugin(Star):
         result = await asyncio.to_thread(self._do_sdk_login, phone, code)
         if not (result.get("code") == 200 and result.get("data", {}).get("token")):
             msg = result.get("msg", result.get("message", "未知错误"))
-            yield event.plain_result(f"❌ 登录失败：{msg}\n提示：验证码可能已过期，请重新 /库街区登录")
+            yield event.plain_result(
+                f"❌ 登录失败：{msg}\n提示：验证码可能已过期，请重新 /库街区登录"
+            )
             return
 
         token = result["data"]["token"]
         nickname = result["data"].get("signature") or result["data"].get("userName", "未知")
 
         # 保存 token，并使用登录时的设备标识，保证后续接口一致
+        old_token = self._get_token()
         self.config["token"] = token
         self.config["devcode"] = LOGIN_DEVCODE
         self.config["distinct_id"] = LOGIN_DISTINCT_ID
@@ -722,20 +948,25 @@ class KuroCheckinPlugin(Star):
         try:
             self.config.save_config()
         except Exception as e:
-            logger.error(f"【库街区签到】保存配置失败: {e}")
+            self.config["token"] = old_token
+            logger.error(f"【库街区签到】登录后保存配置失败，已回滚: {e}")
+            yield event.plain_result(f"❌ 登录成功但配置写入失败，本次绑定未生效：{e}")
+            return
 
+        logger.info(
+            f"【库街区签到】登录成功 sender={user_id} 昵称={nickname}（{self._mask_token(token)}）"
+        )
         yield event.plain_result(f"✅ 登录成功！{nickname}")
 
         # 登录成功后立即签到
         lines = await self.do_sign_all()
         yield event.plain_result(f"📋 签到结果:\n" + "\n".join(lines))
 
-
     # ------------------------------------------------------------------
     # 签到主流程
     # ------------------------------------------------------------------
 
-    async def do_sign_all(self) -> list[str]:
+    async def do_sign_all(self) -> List[str]:
         """执行全部签到，返回结果文本行列表。"""
         lines: list[str] = ["【库街区每日签到】"]
         token = self._get_token()

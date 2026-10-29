@@ -12,11 +12,10 @@ from Crypto.PublicKey.RSA import construct
 from Crypto.Cipher import PKCS1_v1_5
 from geeked.slide import SlideSolver
 from geeked.gobang import GobangSolver
-from geeked.icon import IconSolver
 
 class LotParser:
     def __init__(self):
-        self.mapping = {"n[3:5]+n[9:11]":'n[7:12]'}
+        self.mapping = {"(n[15:20])+.+(n[20:27])+.+(n[2:3]+n[8:9])":'n[10:15]'}
         self.lot = []
         self.lot_res = []
         for k, v in self.mapping.items():
@@ -142,46 +141,46 @@ function encrypt_asymmetric_2(input, key) {
     @staticmethod
     def generate_pow(lot_number_pow, captcha_id_pow, hash_func, hash_version, bits, date, empty) -> dict:
         """Generate the pow_msg & pow_sign | translated directly from the .js"""
-        bit_remainder = bits % 4
-        bit_division = bits // 4
-
-        prefix = '0' * bit_division
         pow_string = f"{hash_version}|{bits}|{hash_func}|{date}|{captcha_id_pow}|{lot_number_pow}|{empty}|"
+
+        if hash_func == 'md5':
+            hash_algo = hashlib.md5
+        elif hash_func == 'sha1':
+            hash_algo = hashlib.sha1
+        elif hash_func == 'sha256':
+            hash_algo = hashlib.sha256
+        else:
+            raise ValueError(f"Unsupported hash function: {hash_func}. Create an issue")
+
+        hex_zeros = bits // 4
+        extra_zero_bits = bits % 4
+        prefix = '0' * hex_zeros
+        max_hex_char = ''
+        if extra_zero_bits == 1:
+            max_hex_char = '7'
+        elif extra_zero_bits == 2:
+            max_hex_char = '3'
+        elif extra_zero_bits == 3:
+            max_hex_char = '1'
 
         while True:
             h = Signer.rand_uid()
             combined = pow_string + h
-            hashed_value = None
 
-            if hash_func == 'md5':
-                hashed_value = hashlib.md5(combined.encode('utf-8')).hexdigest()
-            elif hash_func == 'sha1':
-                hashed_value = hashlib.sha1(combined.encode('utf-8')).hexdigest()
-            elif hash_func == 'sha256':
-                hashed_value = hashlib.sha256(combined.encode('utf-8')).hexdigest()
+            hashed_value = hash_algo(combined.encode('utf-8')).hexdigest()
 
-            if bit_remainder == 0:
-                if hashed_value.startswith(prefix):
-                    return {'pow_msg': pow_string + h, 'pow_sign': hashed_value}
-            else:
-                if hashed_value.startswith(prefix):
-                    length = len(prefix)
-                    threshold = None
-                    if bit_remainder == 1:
-                        threshold = 7
-                    elif bit_remainder == 2:
-                        threshold = 3
-                    elif bit_remainder == 3:
-                        threshold = 1
-
-                    if length <= threshold:
-                        return {'pow_msg': pow_string + h, 'pow_sign': hashed_value}
+            if hashed_value.startswith(prefix):
+                if extra_zero_bits == 0 or hashed_value[hex_zeros] <= max_hex_char:
+                    return {
+                        'pow_msg': combined, 
+                        'pow_sign': hashed_value
+                    }
 
     @staticmethod
     def generate_w(data: dict, captcha_id: str, risk_type: str):
         lot_number = data['lot_number']
         pow_detail = data['pow_detail']
-        abo = {"1a8R":"daC2"}
+        abo = {"LwjO":"dLVB"}
         base = abo | {
             **Signer.generate_pow(lot_number, captcha_id, pow_detail['hashfunc'], pow_detail['version'],
                                   pow_detail['bits'], pow_detail['datetime'], ""),
@@ -228,14 +227,18 @@ function encrypt_asymmetric_2(input, key) {
                 "userresponse": left / 1.0059466666666665 + 2  # 1.0059466666666665 = .8876 * 340 / 300
             }
         elif risk_type in ("winlinze", "gobang"):
-            base |= {
-                "userresponse": GobangSolver(data["ques"]).find_four_in_line()
-            }
-        elif risk_type in 'icon':
-            base |= {
-                "passtime": random.randint(600, 1200),  # time in ms it took to solve
-                "userresponse": IconSolver(data["imgs"], data["ques"]).find_icon_position()
-            }
+            resp = GobangSolver(data["ques"]).find_four_in_line()
+            if resp is None:
+                raise RuntimeError("gobang captcha: no solvable line found")
+            base |= {"userresponse": resp}
+        elif risk_type == "icon":
+            # 本插件只用 slide。icon 型依赖未随包发布的 geeked/dddd_server.py
+            # 与 ddddocr 模型，缺失时会抛 ModuleNotFoundError，被上层吞掉后
+            # 表现为「滑块验证失败」这种误导性文案，因此在这里显式说清原因。
+            raise NotImplementedError(
+                "icon captcha 未构建：需要可选模块 geeked/dddd_server.py 与 "
+                "ddddocr（本插件按 risk_type=slide 运行，正常不会走到这里）"
+            )
         else:
             raise NotImplementedError(f"This type ({risk_type}) of captcha is not implemented yet.")
 
